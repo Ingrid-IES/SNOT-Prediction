@@ -1,0 +1,391 @@
+---
+title: "SNOT Models"
+author: "Ingrid Shu"
+date: "7/22/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+library(readxl)
+library(tidyverse)
+library(glmnet)
+library(pROC)
+library(pls)
+library(ada)
+```
+
+```{r}
+source("SNOT_Data_Cleaning.R")
+```
+
+# Predictive modeling -----------------------------------------------------
+## Models we will compare: 
+* Random Forests: allows for non-linear and interaction effects.  Conditional inference trees with permutation-based variable importance scores for unbiased variable selection.
+
+* Support vector machine with a radial basis kernel ("SVM-Radial")
+
+* Step-wise Logistic regression: traditional linear/logistic regression but uses backwards step-wise AIC variable selection ("LogReg-StepAIC")
+
+* LASSO: similar to traditional linear/logistic regression except the regression coefficients are shrunk towards zero to perform variable selection (unimportant variables are given coefficients exactly equal to 0, effectively removing these variables from the model).  Assumes only linear and additive effects (i.e. no interactions)
+
+* MARS: similar to traditional linear/logistic regression but uses stepwise methods for variable selection, and allows for non-linear and interaction effects (unlike LASSO) 
+
+* Multiple Regression
+
+* Logistic Regression
+
+* PCA and PLS
+
+* Ridge Regression
+
+* Adaptive Boosting
+
+#Evaluating classification accuracy: Repeated 10-fold cross validation (100 repeats) was used to tune and evaluate the classification accuracy of each model (AUC, sensitivity, specificity)
+
+```{r}
+mldat_bin <- pdat %>% dplyr::select(SNOT22Change_bin,all_of(mlpredictors)) 
+mldat_bin <-  data.frame(mldat_bin[-which(is.na(mldat_bin$SNOT22Change_bin)),])
+
+mldat_cts <- pdat %>% dplyr::select(SNOT22Change_cts,all_of(mlpredictors)) 
+mldat_cts <-  data.frame(mldat_cts[-which(is.na(mldat_cts$SNOT22Change_cts)),])
+```
+* method: boot, cv, repeatedcv, LOOCV
+* number: number of folds for cross-validation
+* repeats: for "repeatedcv", is the number of resampling iterations (resamples in boot, repetitions of the cv)
+* classProbs: should class probabilities be computed for classification models (long iwth predicted values)
+* twoClassSummary: computes sensitivity, specificity, AUC (other options: defaultSummary)
+* sampling: to handle class imbalances (https://topepo.github.io/caret/subsampling-for-class-imbalances.html)
+
+```{r}
+ctrl_bin <- trainControl(method="repeatedcv", classProbs=TRUE, repeats=10,  number=10,
+                         sampling = "down",
+                         summaryFunction = twoClassSummary, savePredictions = TRUE)
+ 
+
+ctrl_cts <-  trainControl(method="repeatedcv", number=10, repeats=10)
+
+```
+
+methods accepted by caret
+http://topepo.github.io/caret/train-models-by-tag.html#logistic-regression
+
+# Impute missing covariate data -------------------------------------------
+```{r}
+set.seed(123)
+X <- data.frame(mldat_bin[,-which(colnames(mldat_bin)=="SNOT22Change_bin")])
+X <- data.frame(mldat_bin[,-1])
+X[sapply(X, is.character)] <- lapply(X[sapply(X, is.character)], 
+                                     as.factor)
+imputeX <- missForest(X)
+imputedata_bin <- data.frame(SNOT22Change_bin=mldat_bin[,which(colnames(mldat_bin)=="SNOT22Change_bin")],imputeX$ximp)
+imputedata_cts <- data.frame(SNOT22Change_cts=mldat_cts[,which(colnames(mldat_cts)=="SNOT22Change_cts")],imputeX$ximp)
+```
+# Multiple Regression (on continuous outcome) -------------------------
+```{r}
+set.seed(123)
+mult_reg <- train(SNOT22Change_cts ~., data = imputedata_cts, method = "lm", 
+                  trControl = trainControl(method = "repeatedcv", repeats = 10, number = 10),
+                  metric="RMSE")
+
+summary(mult_reg)
+print(mult_reg)
+
+# variable importance from multiple regression
+ggplot(varImp(mult_reg))
+```
+
+
+# Logistic Regression (on binary outcome) ----------------------------
+```{r}
+set.seed(123)
+log_reg <- train(SNOT22Change_bin ~., data = imputedata_bin, method = "glm", family = "binomial",
+                 trControl = trainControl(method="repeatedcv", classProbs=TRUE, repeats=10, number=10,
+                                            summaryFunction = twoClassSummary, savePredictions = TRUE,
+                                            returnResamp="all"), metric = "ROC")
+
+print(log_reg)
+```
+
+# Ridge Regression (on binary outcome) --------------------------------
+```{r}
+tuneGrid.lambda <- seq(0.001, 10, length.out=10)
+
+X2 <- model.matrix(SNOT22Change_bin ~ ., data=imputedata_bin)
+Y <- imputedata_bin$SNOT22Change_bin
+
+set.seed(123)
+ridge_bin <- train(X2, Y, method = "glmnet",family="binomial",
+                   trControl = trainControl(method="repeatedcv", classProbs=TRUE, repeats=10, number=10,
+                                            summaryFunction = twoClassSummary, savePredictions = TRUE,
+                                            returnResamp="all") ,
+                   tuneGrid = expand.grid(alpha=0, lambda=tuneGrid.lambda),
+                   metric="ROC"
+)
+#optimal lambda
+ridge_bin$bestTune
+#performance metric results for each of the lambdas in tuneGrid (averaged across all of the folds)
+#This is the final performance metric results that are used to choose the "optimal" lambda and thus the "optimal" model
+ridge_bin$results
+#returns the performance metrics for each fold x lambda combination 
+ridge_bin$resample
+#Notice that the ROCs of these two functions values are equal (so we know that the final performance metrics are an 
+#average of the performance metrics across each of the folds)
+mean(subset(ridge_bin$resample, lambda==0.001)$ROC)
+subset(ridge_bin$results, lambda==0.001)
+
+
+# var imp plot for ridge and lasso models turn out weird
+# ggplot(varImp(ridge_bin))
+```
+# Ridge Regression (on continuous outcome) --------------------------------
+```{r}
+X2 <- model.matrix(SNOT22Change_cts ~ ., data=imputedata_cts)
+Y <- imputedata_cts$SNOT22Change_cts
+
+set.seed(123)
+ridge_cts <- train(X2, Y, method = "glmnet",
+                   trControl = trainControl(method="repeatedcv", repeats=10, number=10,
+                                            savePredictions = TRUE,
+                                            returnResamp="all") ,
+                   tuneGrid = expand.grid(alpha=0, lambda=tuneGrid.lambda),
+                   metric="RMSE"
+)
+#optimal lambda
+ridge_cts$bestTune
+#performance metric results for each of the lambdas in tuneGrid (averaged across all of the folds)
+#This is the final performance metric results that are used to choose the "optimal" lambda and thus the "optimal" model
+ridge_cts$results
+#returns the performance metrics for each fold x lambda combination 
+ridge_cts$resample
+#Notice that the ROCs of these two functions values are equal (so we know that the final performance metrics are an 
+#average of the performance metrics across each of the folds)
+mean(subset(ridge_cts$resample, lambda==0.001)$RMSE)
+subset(ridge_cts$results, lambda==0.001)
+```
+# Lasso (on binary outcome) --------------------------------
+```{r}
+tuneGrid.lambda <- seq(0.001, 10, length.out=10)
+
+X2 <- model.matrix(SNOT22Change_bin ~ ., data=imputedata_bin)
+Y <- imputedata_bin$SNOT22Change_bin
+
+set.seed(123)
+lasso_bin <- train(X2, Y, method = "glmnet",family="binomial",
+                   trControl = trainControl(method="repeatedcv", classProbs=TRUE, repeats=10, number=10,
+                                            summaryFunction = twoClassSummary, savePredictions = TRUE,
+                                            returnResamp="all") ,
+                   tuneGrid = expand.grid(alpha=1, lambda=tuneGrid.lambda),
+                   metric="ROC"
+)
+#optimal lambda
+lasso_bin$bestTune
+#performance metric results for each of the lambdas in tuneGrid (averaged across all of the folds)
+#This is the final performance metric results that are used to choose the "optimal" lambda and thus the "optimal" model
+lasso_bin$results
+#returns the performance metrics for each fold x lambda combination 
+lasso_bin$resample
+#Notice that the ROCs of these two functions values are equal (so we know that the final performance metrics are an 
+#average of the performance metrics across each of the folds)
+mean(subset(lasso_bin$resample, lambda==0.001)$ROC)
+subset(lasso_bin$results, lambda==0.001)
+```
+
+# Lasso (on continuous outcome) --------------------------------
+```{r}
+X2 <- model.matrix(SNOT22Change_cts ~ ., data=imputedata_cts)
+Y <- imputedata_cts$SNOT22Change_cts
+
+set.seed(123)
+lasso_cts <- train(X2, Y, method = "glmnet",
+                   trControl = trainControl(method="repeatedcv", repeats=10, number=10,
+                                            savePredictions = TRUE,
+                                            returnResamp="all") ,
+                   tuneGrid = expand.grid(alpha=1, lambda=tuneGrid.lambda),
+                   metric="RMSE"
+)
+#optimal lambda
+lasso_cts$bestTune
+#performance metric results for each of the lambdas in tuneGrid (averaged across all of the folds)
+#This is the final performance metric results that are used to choose the "optimal" lambda and thus the "optimal" model
+lasso_cts$results
+#returns the performance metrics for each fold x lambda combination 
+lasso_cts$resample
+#Notice that the ROCs of these two functions values are equal (so we know that the final performance metrics are an 
+#average of the performance metrics across each of the folds)
+mean(subset(lasso_cts$resample, lambda==0.001)$RMSE)
+subset(lasso_cts$results, lambda==0.001)
+```
+
+
+# SVM ---------------------------------------------------------------------
+```{r}
+set.seed(123)
+tune_svm_bin <- train(SNOT22Change_bin ~ ., data=imputedata_bin, method='svmRadialCost',
+                      tuneLength=5,
+                      trControl=ctrl_bin, metric="ROC", preProcess = c("center","scale"))
+
+tune_svm_cts <- train(SNOT22Change_cts ~ ., data=imputedata_cts, method='svmRadialCost',
+                      tuneLength=5,
+                      trControl=ctrl_cts, metric="RMSE", preProcess = c("center","scale"))
+```
+
+# Conditional random forest -----------------------------------------------
+# Tune hyperparameter 'mtry' with a grid search 
+# first with binary outcome
+```{r}
+# tuneGrid.mtry <- seq(2, 10, by=1)
+# 
+# set.seed(12345)
+# rf_bin <- train(SNOT22Change_bin ~ ., method = "cforest", data= imputedata_bin,
+#                 trControl = trainControl(method="cv", classProbs=TRUE, number=10,
+#                                          summaryFunction = twoClassSummary, savePredictions = TRUE,
+#                                          returnResamp="all") ,
+#                 tuneGrid = expand.grid(mtry=tuneGrid.mtry),
+#                 metric="ROC"
+# )
+# #optimal mtry
+# rf_bin$bestTune
+# #performance metric results for each of the lambdas in tuneGrid (averaged across all of the folds)
+# #This is the final performance metric results that are used to choose the "optimal" lambda and thus the "optimal" model
+# rf_bin$results
+# #returns the performance metrics for each fold x lambda combination 
+# rf_bin$resample
+# #Notice that the ROCs of these two functions values are equal (so we know that the final performance metrics are an 
+# #average of the performance metrics across each of the folds)
+# mean(subset(rf_bin$resample, mtry==2)$ROC)
+# subset(rf_bin$results, mtry==2)
+```
+# next with continuous outcome
+```{r}
+# tuneGrid.mtry <- seq(2, 10, by=1)
+# 
+# set.seed(12345)
+# rf_cts <- train(SNOT22Change_cts ~ ., method = "cforest", data= imputedata_cts,
+#                 trControl = trainControl(method="cv", repeats=10,
+#                                           savePredictions = TRUE,
+#                                          returnResamp="all") ,
+#                 tuneGrid = expand.grid(mtry=tuneGrid.mtry),
+#                 metric="RMSE"
+# )
+# #optimal mtry
+# rf_cts$bestTune
+# #performance metric results for each of the lambdas in tuneGrid (averaged across all of the folds)
+# #This is the final performance metric results that are used to choose the "optimal" lambda and thus the "optimal" model
+# rf_cts$results
+# #returns the performance metrics for each fold x lambda combination 
+# rf_cts$resample
+# #Notice that the ROCs of these two functions values are equal (so we know that the final performance metrics are an 
+# #average of the performance metrics across each of the folds)
+# mean(subset(rf_cts$resample, mtry==2)$RMSE)
+# subset(rf_cts$results, mtry==2)
+```
+
+
+# Variable Importance
+```{r}    
+# set.seed(seed)
+# vimp <- varImp(tune_cf_bin)
+# vimp2 <- data.frame(Feature=rownames(vimp$importance), Importance=vimp$importance$Overall)
+# vimp2 <- vimp2[order(vimp2$Importance, decreasing = FALSE), ]
+# vimp2$Feature <- factor(vimp2$Feature, levels=vimp2$Feature)
+# 
+# p <- ggplot(vimp2, aes(y = Feature, x = Importance)) +
+#   geom_bar(stat="identity")+
+#   xlab("Importance")+ylab("Feature")+ggtitle("Random Forest")
+# p
+```
+
+# Principal Component Regression
+```{r}
+set.seed(123)
+tuneGrid = expand.grid(ncomp = seq(1, 31, by =1))
+
+pcr_cts = train(
+  SNOT22Change_cts ~., data = imputedata_cts, method = "pcr",
+  scale = TRUE,
+  preProcess = c("center", "scale"),
+  trControl = trainControl("repeatedcv", number = 10, repeats = 10),
+  tuneGrid = tuneGrid, 
+  savePredictions = TRUE,
+  returnResamp="all",
+  metric = "RMSE"
+)
+
+
+pcr_cts$bestTune
+
+summary(pcr_cts$finalModel)
+
+plot(pcr_cts)
+
+plot(varImp(pcr_cts))
+
+pcr_cts$results
+```
+# Partial Least Squares
+```{r}
+set.seed(123)
+pls_cts <- train(
+  SNOT22Change_cts ~.,
+  data = imputedata_cts,
+  method = "pls",
+  preProcess = c("center", "scale"),
+  trControl = trainControl(method = "repeatedcv", repeats = 10, number = 10),
+  tuneGrid = tuneGrid,
+  savePredictions = TRUE,
+  returnResamp="all",
+  metric = "RMSE"
+)
+
+pls_cts$bestTune
+
+plot(pls_cts)
+
+plot(varImp(pls_cts))
+```
+# Ada boost
+```{r}
+# ctrl_bin <- trainControl(method="repeatedcv", classProbs=TRUE, repeats=10,  number=10,
+#                          sampling = "down",
+#                          summaryFunction = twoClassSummary, savePredictions = TRUE) 
+# 
+# ctrl_cts <- trainControl(method="repeatedcv", number=10, repeats=10) 
+# 
+# nIter=2:3
+# method.ada <- "Adaboost.M1"
+# tunegrid <- expand.grid(.nIter=nIter, .method=method.ada)
+# 
+# adaboost_bin <- train(
+#   SNOT22Change_bin ~ .,
+#   data=imputedata_bin,
+#   method = "adaboost",
+#   trControl = ctrl_bin,
+#   tuneGrid = tunegrid,
+#   # tuneLength=2,
+#   metric = "ROC"
+# )
+
+
+```
+
+
+# Comparison of models 
+```{r}
+set.seed(123)
+model_list_bin <- list(lasso = lasso_bin, ridge = ridge_bin, logistic_regression = log_reg, svm_bin = tune_svm_bin)
+res_bin <- resamples(model_list_bin)
+summary(res_bin)
+
+model_list_cts <- list(pcr = pcr_cts, pls = pls_cts, multipleRegression = mult_reg, lasso = lasso_cts, ridge = ridge_cts, svm_cts = tune_svm_cts) #cforest = tune_cf_cts, svm = tune_svm_cts, )
+res_cts <- resamples(model_list_cts)
+summary(res_cts)
+```
+
+
+
+```{r}
+# save(imp, file=paste0(Dir0,”/hi.RData”)) ##########save models
+# load(file=paste0(Dir0,”/hi.RData”)) ############reload it in
+
+```
